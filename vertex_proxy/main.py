@@ -9,8 +9,11 @@ Exposes:
 
 from __future__ import annotations
 
+import asyncio
+import email.utils
 import json
 import logging
+import random
 import threading
 import time
 import uuid
@@ -34,6 +37,106 @@ from .openai_anthropic_bridge import (
 )
 
 logger = logging.getLogger(__name__)
+
+_RETRYABLE_UPSTREAM_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _vertex_host(region: str) -> str:
+    """Return the Vertex AI hostname for a region, including the global endpoint."""
+    return "aiplatform.googleapis.com" if region == "global" else f"{region}-aiplatform.googleapis.com"
+
+
+def _retry_after_seconds(resp: httpx.Response | None) -> float | None:
+    if resp is None:
+        return None
+    raw = resp.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, dt.timestamp() - time.time())
+
+
+def _retry_delay(cfg: Settings, attempt_index: int, resp: httpx.Response | None = None) -> float:
+    max_delay = max(0.0, float(cfg.upstream_retry_max_delay_seconds))
+    retry_after = _retry_after_seconds(resp)
+    if retry_after is not None:
+        return min(retry_after, max_delay) if max_delay else retry_after
+    base = max(0.0, float(cfg.upstream_retry_base_delay_seconds))
+    delay = base * (2 ** max(0, attempt_index - 1))
+    jitter_ratio = max(0.0, float(cfg.upstream_retry_jitter_ratio))
+    if jitter_ratio:
+        delay += random.uniform(0.0, delay * jitter_ratio)
+    return min(delay, max_delay) if max_delay else delay
+
+
+def _attempts(cfg: Settings) -> int:
+    return max(1, int(cfg.upstream_retry_attempts))
+
+
+async def _post_with_retries(
+    http: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    *,
+    cfg: Settings,
+    route: str,
+    model: str,
+) -> httpx.Response:
+    attempts = _attempts(cfg)
+    last_exc: httpx.HTTPError | None = None
+    last_resp: httpx.Response | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = await http.post(url, headers=headers, json=body)
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            retryable = True
+            resp = None
+        else:
+            last_resp = resp
+            retryable = resp.status_code in _RETRYABLE_UPSTREAM_STATUSES
+            if not retryable or attempt >= attempts:
+                return resp
+
+        if attempt >= attempts:
+            break
+        delay = _retry_delay(cfg, attempt, resp)
+        if resp is not None:
+            logger.warning(
+                "%s upstream returned %s for model=%s; retrying in %.1fs (attempt %d/%d)",
+                route,
+                resp.status_code,
+                model,
+                delay,
+                attempt + 1,
+                attempts,
+            )
+        else:
+            logger.warning(
+                "%s upstream error for model=%s: %s; retrying in %.1fs (attempt %d/%d)",
+                route,
+                model,
+                last_exc,
+                delay,
+                attempt + 1,
+                attempts,
+            )
+        await asyncio.sleep(delay)
+
+    if last_resp is not None:
+        return last_resp
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("upstream retry loop ended without response or exception")
+
 
 # --- Ollama model registry (populated at startup) --------------------------
 _OLLAMA_MODELS: dict[str, str] = {}  # model name -> Ollama base_url
@@ -475,12 +578,16 @@ async def _handle_anthropic(request: Request, cfg: Settings, tm: TokenManager) -
     if streaming:
         _METRICS.record_request("anthropic", requested_model, 200)
         return StreamingResponse(
-            _stream_bytes(http, url, headers, upstream_body),
+            _stream_bytes(
+                http, url, headers, upstream_body, cfg=cfg, route="anthropic", model=requested_model
+            ),
             media_type="text/event-stream",
         )
 
     try:
-        resp = await http.post(url, headers=headers, json=upstream_body)
+        resp = await _post_with_retries(
+            http, url, headers, upstream_body, cfg=cfg, route="anthropic", model=requested_model
+        )
     except httpx.HTTPError as exc:
         logger.error("anthropic upstream error: %s", exc)
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
@@ -511,7 +618,7 @@ async def _handle_gemini(
         body = {}
 
     url = (
-        f"https://{cfg.gemini_region}-aiplatform.googleapis.com/v1/projects/"
+        f"https://{_vertex_host(cfg.gemini_region)}/v1/projects/"
         f"{cfg.project_id}/locations/{cfg.gemini_region}/publishers/google/"
         f"models/{vertex_model}:{action}"
     )
@@ -536,12 +643,14 @@ async def _handle_gemini(
     if streaming:
         _METRICS.record_request("gemini", requested_model, 200)
         return StreamingResponse(
-            _stream_bytes(http, url, headers, body),
+            _stream_bytes(http, url, headers, body, cfg=cfg, route="gemini", model=requested_model),
             media_type="text/event-stream",
         )
 
     try:
-        resp = await http.post(url, headers=headers, json=body)
+        resp = await _post_with_retries(
+            http, url, headers, body, cfg=cfg, route="gemini", model=requested_model
+        )
     except httpx.HTTPError as exc:
         logger.error("gemini upstream error: %s", exc)
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
@@ -590,7 +699,7 @@ async def _handle_openai(request: Request, cfg: Settings, tm: TokenManager) -> A
         bare_model = requested_model.removeprefix("google/")
         vertex_model = cfg.gemini_model_aliases.get(bare_model, bare_model)
         url = (
-            f"https://{cfg.gemini_region}-aiplatform.googleapis.com/v1beta1/projects/"
+            f"https://{_vertex_host(cfg.gemini_region)}/v1beta1/projects/"
             f"{cfg.project_id}/locations/{cfg.gemini_region}/endpoints/openapi/chat/completions"
         )
         upstream_body = dict(body)
@@ -637,12 +746,14 @@ async def _handle_openai(request: Request, cfg: Settings, tm: TokenManager) -> A
     if streaming:
         _METRICS.record_request("openai", requested_model, 200)
         return StreamingResponse(
-            _stream_bytes(http, url, headers, upstream_body),
+            _stream_bytes(http, url, headers, upstream_body, cfg=cfg, route="openai", model=requested_model),
             media_type="text/event-stream",
         )
 
     try:
-        resp = await http.post(url, headers=headers, json=upstream_body)
+        resp = await _post_with_retries(
+            http, url, headers, upstream_body, cfg=cfg, route="openai", model=requested_model
+        )
     except httpx.HTTPError as exc:
         logger.error("maas upstream error: %s", exc)
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
@@ -724,12 +835,14 @@ async def _handle_openai_to_anthropic(
     if streaming:
         _METRICS.record_request("openai-anthropic", requested_model, 200)
         return StreamingResponse(
-            _stream_anthropic_as_openai(http, url, headers, anthropic_body, requested_model),
+            _stream_anthropic_as_openai(http, url, headers, anthropic_body, requested_model, cfg=cfg),
             media_type="text/event-stream",
         )
 
     try:
-        resp = await http.post(url, headers=headers, json=anthropic_body)
+        resp = await _post_with_retries(
+            http, url, headers, anthropic_body, cfg=cfg, route="openai-anthropic", model=requested_model
+        )
     except httpx.HTTPError as exc:
         logger.error("anthropic upstream error (openai bridge): %s", exc)
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
@@ -768,42 +881,74 @@ async def _stream_anthropic_as_openai(
     headers: dict[str, str],
     body: dict[str, Any],
     model: str,
+    *,
+    cfg: Settings,
 ) -> AsyncGenerator[bytes, None]:
     """Stream Anthropic SSE events, translating each to OpenAI SSE format."""
-    try:
-        async with http.stream(
-            "POST",
-            url,
-            headers=headers,
-            json=body,
-            timeout=STREAM_HTTP_TIMEOUT,
-        ) as r:
-            if r.status_code >= 400:
-                err_body = b""
+    attempts = _attempts(cfg)
+    for attempt in range(1, attempts + 1):
+        try:
+            async with http.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=body,
+                timeout=STREAM_HTTP_TIMEOUT,
+            ) as r:
+                if r.status_code >= 400:
+                    err_body = b""
+                    async for chunk in r.aiter_bytes():
+                        err_body += chunk
+                    detail = err_body.decode("utf-8", errors="replace")[:2000]
+                    if r.status_code in _RETRYABLE_UPSTREAM_STATUSES and attempt < attempts:
+                        delay = _retry_delay(cfg, attempt, r)
+                        logger.warning(
+                            "upstream anthropic stream returned %s for model=%s; retrying in %.1fs (attempt %d/%d): %s",
+                            r.status_code,
+                            model,
+                            delay,
+                            attempt + 1,
+                            attempts,
+                            detail,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    logger.warning("upstream anthropic stream returned %s: %s", r.status_code, detail)
+                    yield _stream_error("upstream_http_error", detail, status_code=r.status_code)
+                    return
+                stream_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+                buf = b""
                 async for chunk in r.aiter_bytes():
-                    err_body += chunk
-                detail = err_body.decode("utf-8", errors="replace")[:2000]
-                logger.warning("upstream anthropic stream returned %s: %s", r.status_code, detail)
-                yield _stream_error("upstream_http_error", detail, status_code=r.status_code)
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        translated = anthropic_stream_to_openai_stream(line, model, stream_id)
+                        if translated:
+                            yield translated
                 return
-            stream_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-            buf = b""
-            async for chunk in r.aiter_bytes():
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    translated = anthropic_stream_to_openai_stream(line, model, stream_id)
-                    if translated:
-                        yield translated
-    except httpx.ReadTimeout as exc:
-        logger.warning("upstream anthropic stream read timeout: %s", exc)
-        yield _stream_error(
-            "upstream_read_timeout",
-            "upstream stream stalled before completion",
-        )
-    except httpx.HTTPError as exc:
-        logger.error("upstream anthropic stream error: %s", exc)
-        yield _stream_error("upstream_stream_error", str(exc))
+        except httpx.ReadTimeout as exc:
+            logger.warning("upstream anthropic stream read timeout: %s", exc)
+            yield _stream_error(
+                "upstream_read_timeout",
+                "upstream stream stalled before completion",
+            )
+            return
+        except httpx.HTTPError as exc:
+            if attempt < attempts:
+                delay = _retry_delay(cfg, attempt)
+                logger.warning(
+                    "upstream anthropic stream error for model=%s: %s; retrying in %.1fs (attempt %d/%d)",
+                    model,
+                    exc,
+                    delay,
+                    attempt + 1,
+                    attempts,
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.error("upstream anthropic stream error: %s", exc)
+            yield _stream_error("upstream_stream_error", str(exc))
+            return
 
 
 # --- helpers ----------------------------------------------------------------
@@ -814,37 +959,77 @@ async def _stream_bytes(
     url: str,
     headers: dict[str, str],
     body: dict[str, Any],
+    *,
+    cfg: Settings | None = None,
+    route: str = "stream",
+    model: str = "",
 ) -> AsyncGenerator[bytes, None]:
-    try:
-        async with http.stream(
-            "POST",
-            url,
-            headers=headers,
-            json=body,
-            timeout=STREAM_HTTP_TIMEOUT,
-        ) as r:
-            if r.status_code >= 400:
-                # StreamingResponse has already committed to a 200 status by
-                # the time this generator runs, so emit a structured SSE error
-                # instead of raising and leaving the client with a broken chunk.
-                err_body = b""
+    attempts = _attempts(cfg) if cfg is not None else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            async with http.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=body,
+                timeout=STREAM_HTTP_TIMEOUT,
+            ) as r:
+                if r.status_code >= 400:
+                    # StreamingResponse has already committed to a 200 status by
+                    # the time this generator runs, so emit a structured SSE error
+                    # instead of raising and leaving the client with a broken chunk.
+                    err_body = b""
+                    async for chunk in r.aiter_bytes():
+                        err_body += chunk
+                    detail = err_body.decode("utf-8", errors="replace")[:2000]
+                    if (
+                        cfg is not None
+                        and r.status_code in _RETRYABLE_UPSTREAM_STATUSES
+                        and attempt < attempts
+                    ):
+                        delay = _retry_delay(cfg, attempt, r)
+                        logger.warning(
+                            "%s upstream stream returned %s for model=%s; retrying in %.1fs (attempt %d/%d): %s",
+                            route,
+                            r.status_code,
+                            model,
+                            delay,
+                            attempt + 1,
+                            attempts,
+                            detail,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    logger.warning("upstream stream returned %s: %s", r.status_code, detail)
+                    yield _stream_error("upstream_http_error", detail, status_code=r.status_code)
+                    return
                 async for chunk in r.aiter_bytes():
-                    err_body += chunk
-                detail = err_body.decode("utf-8", errors="replace")[:2000]
-                logger.warning("upstream stream returned %s: %s", r.status_code, detail)
-                yield _stream_error("upstream_http_error", detail, status_code=r.status_code)
+                    yield chunk
                 return
-            async for chunk in r.aiter_bytes():
-                yield chunk
-    except httpx.ReadTimeout as exc:
-        logger.warning("upstream stream read timeout: %s", exc)
-        yield _stream_error(
-            "upstream_read_timeout",
-            "upstream stream stalled before completion",
-        )
-    except httpx.HTTPError as exc:
-        logger.error("upstream stream error: %s", exc)
-        yield _stream_error("upstream_stream_error", str(exc))
+        except httpx.ReadTimeout as exc:
+            logger.warning("upstream stream read timeout: %s", exc)
+            yield _stream_error(
+                "upstream_read_timeout",
+                "upstream stream stalled before completion",
+            )
+            return
+        except httpx.HTTPError as exc:
+            if cfg is not None and attempt < attempts:
+                delay = _retry_delay(cfg, attempt)
+                logger.warning(
+                    "%s upstream stream error for model=%s: %s; retrying in %.1fs (attempt %d/%d)",
+                    route,
+                    model,
+                    exc,
+                    delay,
+                    attempt + 1,
+                    attempts,
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.error("upstream stream error: %s", exc)
+            yield _stream_error("upstream_stream_error", str(exc))
+            return
 
 
 def _stream_error(error_type: str, message: str, status_code: int | None = None) -> bytes:

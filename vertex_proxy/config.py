@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     # Access tokens live 60 minutes. Refresh at this interval to stay ahead.
     token_refresh_seconds: int = 3000  # 50 minutes
 
+    # --- Upstream retry/backoff ---
+    # Total attempts for transient upstream failures (429/5xx). 1 disables retry.
+    upstream_retry_attempts: int = 4
+    # Exponential backoff base delay: 5s, 10s, 20s by default.
+    upstream_retry_base_delay_seconds: float = 5.0
+    # Cap delays, and honor Retry-After up to this ceiling.
+    upstream_retry_max_delay_seconds: float = 60.0
+    # Add up to 25% random jitter so repeated callers don't stampede together.
+    upstream_retry_jitter_ratio: float = 0.25
+
     # --- Model aliases ---
     # Map canonical Anthropic model names → Vertex publisher model IDs.
     # Keep this list explicit; we want to know exactly what we're routing.
@@ -73,6 +83,8 @@ class Settings(BaseSettings):
 
     # Map canonical Gemini model names → Vertex publisher model IDs.
     gemini_model_aliases: dict[str, str] = {
+        "gemini-3.6-flash": "gemini-3.6-flash",
+        "gemini-3.5-flash": "gemini-3.5-flash",
         "gemini-2.5-pro": "gemini-2.5-pro",
         "gemini-2.5-flash": "gemini-2.5-flash",
         "gemini-2.0-flash": "gemini-2.0-flash-001",

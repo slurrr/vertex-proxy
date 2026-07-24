@@ -70,6 +70,7 @@ def test_opus_45_and_haiku_45_use_correct_snapshot_dates() -> None:
 
 def test_gemini_aliases_include_pro_and_flash() -> None:
     s = Settings()
+    assert "gemini-3.6-flash" in s.gemini_model_aliases
     assert "gemini-2.5-pro" in s.gemini_model_aliases
     assert "gemini-2.5-flash" in s.gemini_model_aliases
 
